@@ -1,0 +1,112 @@
+name: Publish Studio Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version (for example v2.2.0)'
+        required: true
+        default: 'v2.2.0'
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: studio-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ inputs.version }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Checkout selected commit
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Validate version and refuse existing release or tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "Invalid version"; exit 1; }
+          check_absent() {
+            local endpoint="$1"
+            local status
+            status=$(curl --silent --show-error --output /tmp/github-check.json --write-out '%{http_code}' \
+              --header "Authorization: Bearer $GH_TOKEN" \
+              --header "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/$GH_REPO/$endpoint")
+            [[ "$status" == 404 ]] || { echo "Refusing to continue: $endpoint returned $status (must be 404)"; exit 1; }
+          }
+          check_absent "releases/tags/$VERSION"
+          check_absent "git/ref/tags/$VERSION"
+      - name: Check allowlist and Python syntax; build ZIP and SHA256
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import ast, hashlib, pathlib, subprocess, zipfile
+          files = ['app.py', 'maker.py', 'core.py', 'requirements.txt', 'README_시작하기.md']
+          allowed = set(files) | {'.gitignore', 'README.md', '.github/workflows/release.yml'}
+          tracked = set(subprocess.check_output(['git', 'ls-files', '-z']).decode().split('\0')) - {''}
+          if tracked != allowed:
+              raise SystemExit(f'Repository allowlist mismatch: extra={tracked - allowed}, missing={allowed - tracked}')
+          for name in files:
+              path = pathlib.Path(name)
+              if path.is_symlink() or not path.is_file():
+                  raise SystemExit(f'Not a regular source file: {name}')
+              if name.endswith('.py'):
+                  ast.parse(path.read_bytes(), filename=name)
+          out = pathlib.Path('dist')
+          out.mkdir()
+          archive = out / 'studio-update.zip'
+          with zipfile.ZipFile(archive, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=9) as z:
+              for name in files:
+                  info = zipfile.ZipInfo(name, date_time=(2020, 1, 1, 0, 0, 0))
+                  info.compress_type = zipfile.ZIP_DEFLATED
+                  info.external_attr = 0o100644 << 16
+                  z.writestr(info, pathlib.Path(name).read_bytes(), compresslevel=9)
+          with zipfile.ZipFile(archive) as z:
+              assert z.namelist() == files
+              assert z.testzip() is None
+              for name in files:
+                  assert z.read(name) == pathlib.Path(name).read_bytes()
+          digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+          (out / 'studio-update.sha256').write_text(f'{digest}  studio-update.zip\n', encoding='ascii')
+          print(f'SHA256: {digest}')
+          PY
+          (cd dist && sha256sum --check studio-update.sha256)
+      - name: Create new draft and upload assets (never overwrite)
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release create "$VERSION" dist/studio-update.zip dist/studio-update.sha256 \
+            --target "$GITHUB_SHA" --draft \
+            --title "YouTube Auto Studio $VERSION" \
+            --notes "Allowlisted source update package. Verify studio-update.zip with studio-update.sha256 before applying. Local credentials, databases and videos are excluded."
+      - name: Verify uploaded bytes before publishing
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir verify
+          gh release download "$VERSION" --dir verify --pattern studio-update.zip --pattern studio-update.sha256
+          cmp dist/studio-update.zip verify/studio-update.zip
+          cmp dist/studio-update.sha256 verify/studio-update.sha256
+          (cd verify && sha256sum --check studio-update.sha256)
+          gh release view "$VERSION" --json assets --jq '[.assets[].name] | sort' > /tmp/assets.json
+          python3 -c 'import json; assert json.load(open("/tmp/assets.json")) == ["studio-update.sha256", "studio-update.zip"]'
+      - name: Publish stable latest Release
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release edit "$VERSION" --draft=false --prerelease=false --latest
+          gh api "repos/$GH_REPO/releases/latest" --jq '.tag_name' > /tmp/latest-tag
+          test "$(cat /tmp/latest-tag)" = "$VERSION"
